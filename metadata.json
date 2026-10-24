@@ -1,0 +1,6 @@
+{
+  "name": "gdo-forecasting-dashboard",
+  "description": "Dashboard predittiva per la stima dei colli effettivi di allestimento, rischio tagli ordini e dimensionamento ottimale della squadra addetti con mobilità interna.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
