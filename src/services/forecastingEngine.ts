@@ -603,75 +603,470 @@ export function exportExcelReport(
   XLSX.writeFile(wb, filename);
 }
 
-// Parse imported Excel/CSV file to extract Colonna L and reparti
-export async function parseUploadedExcel(file: File): Promise<Record<string, Record<Sottoreparto, number>>> {
-  const buffer = await file.arrayBuffer();
-  const wb = XLSX.read(buffer, { type: 'array' });
-  const sheetName = wb.SheetNames[0];
-  const ws = wb.Sheets[sheetName];
-  const rawRows: Record<string, unknown>[] = XLSX.utils.sheet_to_json(ws);
-
-  const parsedMatrix: Record<string, Record<Sottoreparto, number>> = {
-    'Lunedì': { ALIMENTARI: 0, CHIMICA: 0, LIQUIDI: 0, PETFOOD: 0, PROFUMERIA: 0 },
-    'Martedì': { ALIMENTARI: 0, CHIMICA: 0, LIQUIDI: 0, PETFOOD: 0, PROFUMERIA: 0 },
-    'Mercoledì': { ALIMENTARI: 0, CHIMICA: 0, LIQUIDI: 0, PETFOOD: 0, PROFUMERIA: 0 },
-    'Giovedì': { ALIMENTARI: 0, CHIMICA: 0, LIQUIDI: 0, PETFOOD: 0, PROFUMERIA: 0 },
-    'Venerdì': { ALIMENTARI: 0, CHIMICA: 0, LIQUIDI: 0, PETFOOD: 0, PROFUMERIA: 0 },
-    'Sabato': { ALIMENTARI: 0, CHIMICA: 0, LIQUIDI: 0, PETFOOD: 0, PROFUMERIA: 0 },
-    'Domenica': { ALIMENTARI: 0, CHIMICA: 0, LIQUIDI: 0, PETFOOD: 0, PROFUMERIA: 0 },
+// Parse imported Excel/CSV file to extract Colonna L and reparti with robust heuristics
+export interface ParsedExcelResult {
+  matrix: Record<string, Record<Sottoreparto, number>>;
+  diagnostics: {
+    totalRowsRead: number;
+    validRowsExtracted: number;
+    distinctDatesCount: number;
+    totalColliExtracted: number;
+    detectedDays: string[];
+    detectedDepartments: string[];
   };
+}
 
-  const counts: Record<string, Record<Sottoreparto, number>> = {
-    'Lunedì': { ALIMENTARI: 0, CHIMICA: 0, LIQUIDI: 0, PETFOOD: 0, PROFUMERIA: 0 },
-    'Martedì': { ALIMENTARI: 0, CHIMICA: 0, LIQUIDI: 0, PETFOOD: 0, PROFUMERIA: 0 },
-    'Mercoledì': { ALIMENTARI: 0, CHIMICA: 0, LIQUIDI: 0, PETFOOD: 0, PROFUMERIA: 0 },
-    'Giovedì': { ALIMENTARI: 0, CHIMICA: 0, LIQUIDI: 0, PETFOOD: 0, PROFUMERIA: 0 },
-    'Venerdì': { ALIMENTARI: 0, CHIMICA: 0, LIQUIDI: 0, PETFOOD: 0, PROFUMERIA: 0 },
-    'Sabato': { ALIMENTARI: 0, CHIMICA: 0, LIQUIDI: 0, PETFOOD: 0, PROFUMERIA: 0 },
-    'Domenica': { ALIMENTARI: 0, CHIMICA: 0, LIQUIDI: 0, PETFOOD: 0, PROFUMERIA: 0 },
-  };
+// Normalize Italian text (remove accents, trim, lowercase)
+function normalizeText(str: unknown): string {
+  if (str === null || str === undefined) return '';
+  return String(str)
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+}
 
-  // Find relevant columns
-  for (const row of rawRows) {
-    const keys = Object.keys(row);
-    // Date column usually includes "Data" or is index 1
-    const dateKey = keys.find((k) => k.toLowerCase().includes('data')) || keys[1];
-    // Reparto key
-    const deptKey = keys.find((k) => k.toLowerCase().includes('reparto') || k.toLowerCase().includes('sottoreparto')) || keys[4];
-    // Colonna L (colli effettivi) or colli
-    const colliLKey = keys.find((k) => k.toLowerCase().includes('effettiv') || k.toLowerCase().includes('allestiment') || k.toLowerCase().includes('colli_l')) || keys[11] || keys[10];
+// Italian month map for date string parsing
+const MESI_MAP: Record<string, number> = {
+  gennaio: 0, febbraio: 1, marzo: 2, aprile: 3, maggio: 4, giugno: 5,
+  luglio: 6, agosto: 7, settembre: 8, ottobre: 9, novembre: 10, dicembre: 11,
+  gen: 0, feb: 1, mar: 2, apr: 3, mag: 4, giu: 5, lug: 6, ago: 7, set: 8, ott: 9, nov: 10, dic: 11
+};
 
-    const rawDateStr = String(row[dateKey] || '');
-    const rawDeptStr = String(row[deptKey] || '').toUpperCase();
-    const rawColli = parseFloat(String(row[colliLKey] || '0')) || 0;
+// Robust day-of-week detector
+function extractDayOfWeek(cellVal: unknown): { dayName: string; dateKey: string } | null {
+  if (cellVal === null || cellVal === undefined || cellVal === '') return null;
 
-    // Detect day of week
-    let dayFound: string | null = null;
-    for (const d of GIORNI_ITA) {
-      if (rawDateStr.toLowerCase().includes(d.toLowerCase())) {
-        dayFound = d;
-        break;
+  // 1. If it's a native Date
+  if (cellVal instanceof Date && !isNaN(cellVal.getTime())) {
+    const jsDay = cellVal.getDay();
+    const itaIndex = jsDay === 0 ? 6 : jsDay - 1;
+    const y = cellVal.getFullYear();
+    const m = String(cellVal.getMonth() + 1).padStart(2, '0');
+    const d = String(cellVal.getDate()).padStart(2, '0');
+    return { dayName: GIORNI_ITA[itaIndex], dateKey: `${y}-${m}-${d}` };
+  }
+
+  // 2. If it's an Excel serial date number (typically between 35000 and 60000 for recent years)
+  if (typeof cellVal === 'number' || (!isNaN(Number(cellVal)) && Number(cellVal) >= 30000 && Number(cellVal) <= 65000)) {
+    const serial = Number(cellVal);
+    // Excel epoch 1899-12-30
+    const jsDate = new Date(Math.round((serial - 25569) * 86400 * 1000));
+    if (!isNaN(jsDate.getTime())) {
+      const jsDay = jsDate.getDay();
+      const itaIndex = jsDay === 0 ? 6 : jsDay - 1;
+      const y = jsDate.getFullYear();
+      const m = String(jsDate.getMonth() + 1).padStart(2, '0');
+      const d = String(jsDate.getDate()).padStart(2, '0');
+      return { dayName: GIORNI_ITA[itaIndex], dateKey: `${y}-${m}-${d}` };
+    }
+  }
+
+  const str = String(cellVal).trim();
+  const normalized = normalizeText(str);
+
+  // 3. Check for day name in text (e.g. "Lunedì 15 Gennaio 2024" or "lunedi")
+  if (normalized.includes('lunedi') || normalized.startsWith('lun')) {
+    return { dayName: 'Lunedì', dateKey: str };
+  }
+  if (normalized.includes('martedi') || normalized.startsWith('mar')) {
+    return { dayName: 'Martedì', dateKey: str };
+  }
+  if (normalized.includes('mercoledi') || normalized.startsWith('mer')) {
+    return { dayName: 'Mercoledì', dateKey: str };
+  }
+  if (normalized.includes('giovedi') || normalized.startsWith('gio')) {
+    return { dayName: 'Giovedì', dateKey: str };
+  }
+  if (normalized.includes('venerdi') || normalized.startsWith('ven')) {
+    return { dayName: 'Venerdì', dateKey: str };
+  }
+  if (normalized.includes('sabato') || normalized.startsWith('sab')) {
+    return { dayName: 'Sabato', dateKey: str };
+  }
+  if (normalized.includes('domenica') || normalized.startsWith('dom')) {
+    return { dayName: 'Domenica', dateKey: str };
+  }
+
+  // 4. Try parsing Italian text date: e.g. "15 Gennaio 2024" or "15-Gen-24"
+  const parts = normalized.split(/[\s,./-]+/).filter(Boolean);
+  if (parts.length >= 3) {
+    let dayNum = -1;
+    let monthNum = -1;
+    let yearNum = -1;
+
+    for (const part of parts) {
+      if (MESI_MAP[part] !== undefined) {
+        monthNum = MESI_MAP[part];
+      } else if (!isNaN(Number(part))) {
+        const n = parseInt(part, 10);
+        if (n >= 1990 && n <= 2050) {
+          yearNum = n;
+        } else if (n >= 1 && n <= 31 && dayNum === -1) {
+          dayNum = n;
+        } else if (n >= 1 && n <= 12 && monthNum === -1) {
+          monthNum = n - 1;
+        }
       }
     }
 
-    // Match department
-    const matchedDept = DEPARTMENTS.find((d) => rawDeptStr.includes(d));
-
-    if (dayFound && matchedDept && rawColli > 0) {
-      parsedMatrix[dayFound][matchedDept] += rawColli;
-      counts[dayFound][matchedDept] += 1;
+    if (dayNum !== -1 && monthNum !== -1) {
+      if (yearNum === -1) yearNum = new Date().getFullYear();
+      const parsedD = new Date(yearNum, monthNum, dayNum);
+      if (!isNaN(parsedD.getTime())) {
+        const jsDay = parsedD.getDay();
+        const itaIndex = jsDay === 0 ? 6 : jsDay - 1;
+        return {
+          dayName: GIORNI_ITA[itaIndex],
+          dateKey: `${yearNum}-${String(monthNum + 1).padStart(2, '0')}-${String(dayNum).padStart(2, '0')}`
+        };
+      }
     }
   }
 
-  // If no rows were categorized (e.g. format differs), return default with small variation
-  const totalExtracted = Object.values(parsedMatrix).reduce(
-    (acc, day) => acc + Object.values(day).reduce((s, v) => s + v, 0),
-    0
-  );
-
-  if (totalExtracted === 0) {
-    throw new Error('Nessun dato compatibile trovato nel file. Assicurati che contenga colonne per Data, Sottoreparto e Colli Effettivi (Colonna L).');
+  // 5. Try standard date format DD/MM/YYYY or YYYY-MM-DD
+  const stdDate = new Date(str);
+  if (!isNaN(stdDate.getTime()) && stdDate.getFullYear() > 1990) {
+    const jsDay = stdDate.getDay();
+    const itaIndex = jsDay === 0 ? 6 : jsDay - 1;
+    return { dayName: GIORNI_ITA[itaIndex], dateKey: str };
   }
 
-  return parsedMatrix;
+  return null;
 }
+
+// Robust department detector
+function extractDepartment(cellVal: unknown, entireRow?: unknown[]): Sottoreparto | null {
+  const checkString = (val: unknown): Sottoreparto | null => {
+    if (!val) return null;
+    const norm = normalizeText(val).toUpperCase();
+
+    if (norm.includes('ALIMENTAR') || norm.includes('FOOD') || norm.includes('GENERI VARI') || norm.includes('SECCO') || norm.includes('FRESCO')) {
+      return 'ALIMENTARI';
+    }
+    if (norm.includes('CHIMIC') || norm.includes('DETERGENZ') || norm.includes('PULIZIA') || norm.includes('CASA')) {
+      return 'CHIMICA';
+    }
+    if (norm.includes('LIQUID') || norm.includes('BEVERAGE') || norm.includes('BEVAND') || norm.includes('BIBIT') || norm.includes('ACQU') || norm.includes('BIRRA') || norm.includes('VINO')) {
+      return 'LIQUIDI';
+    }
+    if (norm.includes('PET') || norm.includes('ANIMAL')) {
+      return 'PETFOOD';
+    }
+    if (norm.includes('PROFUM') || norm.includes('COSMES') || norm.includes('IGIENE') || norm.includes('PERSONA')) {
+      return 'PROFUMERIA';
+    }
+    return null;
+  };
+
+  // First check specific column
+  const directMatch = checkString(cellVal);
+  if (directMatch) return directMatch;
+
+  // If not matched directly, scan entire row
+  if (entireRow && Array.isArray(entireRow)) {
+    for (const cell of entireRow) {
+      const match = checkString(cell);
+      if (match) return match;
+    }
+  }
+
+  return null;
+}
+
+// Clean number parser
+function parseColliNumber(val: unknown): number {
+  if (val === null || val === undefined || val === '') return 0;
+  if (typeof val === 'number') return isNaN(val) ? 0 : val;
+  const cleaned = String(val).replace(/\s/g, '').replace(',', '.');
+  const num = parseFloat(cleaned);
+  return isNaN(num) ? 0 : num;
+}
+
+export async function parseUploadedExcel(file: File): Promise<ParsedExcelResult> {
+  const buffer = await file.arrayBuffer();
+  // Read workbook with cellDates enabled
+  const wb = XLSX.read(buffer, { type: 'array', cellDates: true });
+  const sheetName = wb.SheetNames[0];
+  const ws = wb.Sheets[sheetName];
+
+  // 1. Get as 2D array
+  const rawRows: unknown[][] = XLSX.utils.sheet_to_json(ws, { header: 1, defval: '' });
+
+  if (!rawRows || rawRows.length === 0) {
+    throw new Error('Il file Excel risulta vuoto o non leggibile.');
+  }
+
+  // 2. Locate header row (typically row 0, 1, or 2)
+  let headerRowIdx = 0;
+  let colBDateIdx = 1; // Default to Column B (idx 1) exactly as in Python
+  let colKOrdinatiIdx = 10; // Default to Column K (idx 10)
+  let colLEffettiviIdx = 11; // Default to Column L (idx 11)
+  let colDeptIdx = 4; // Default to Column E (idx 4)
+  let colDestinazioneIdx = -1;
+
+  for (let r = 0; r < Math.min(15, rawRows.length); r++) {
+    const row = rawRows[r];
+    if (!Array.isArray(row)) continue;
+
+    for (let c = 0; c < row.length; c++) {
+      const txt = normalizeText(row[c]);
+      if (txt.includes('data') || txt.includes('allestimento')) {
+        colBDateIdx = c;
+        headerRowIdx = r;
+      }
+      if (txt.includes('effettiv') || txt.includes('allestimento effettiv') || txt === 'colli l') {
+        colLEffettiviIdx = c;
+      }
+      if (txt.includes('ordinat') || txt === 'colli k') {
+        colKOrdinatiIdx = c;
+      }
+      if (txt.includes('sottoreparto') || txt.includes('reparto')) {
+        colDeptIdx = c;
+      }
+      if (txt.includes('destinazione')) {
+        colDestinazioneIdx = c;
+      }
+    }
+
+    // If we found both data and effettivi/reparto, this is our header
+    if (headerRowIdx === r && (colLEffettiviIdx !== 11 || colDeptIdx !== 4)) {
+      break;
+    }
+  }
+
+  // 3. Daily grouping data structures
+  // Group by (dateKey + dept) to compute daily totals per date, then average per day-of-week
+  const dateTotals: Record<string, { dayName: string; reparti: Record<Sottoreparto, number> }> = {};
+  const directDayTotals: Record<string, Record<Sottoreparto, number>> = {
+    'Lunedì': { ALIMENTARI: 0, CHIMICA: 0, LIQUIDI: 0, PETFOOD: 0, PROFUMERIA: 0 },
+    'Martedì': { ALIMENTARI: 0, CHIMICA: 0, LIQUIDI: 0, PETFOOD: 0, PROFUMERIA: 0 },
+    'Mercoledì': { ALIMENTARI: 0, CHIMICA: 0, LIQUIDI: 0, PETFOOD: 0, PROFUMERIA: 0 },
+    'Giovedì': { ALIMENTARI: 0, CHIMICA: 0, LIQUIDI: 0, PETFOOD: 0, PROFUMERIA: 0 },
+    'Venerdì': { ALIMENTARI: 0, CHIMICA: 0, LIQUIDI: 0, PETFOOD: 0, PROFUMERIA: 0 },
+    'Sabato': { ALIMENTARI: 0, CHIMICA: 0, LIQUIDI: 0, PETFOOD: 0, PROFUMERIA: 0 },
+    'Domenica': { ALIMENTARI: 0, CHIMICA: 0, LIQUIDI: 0, PETFOOD: 0, PROFUMERIA: 0 },
+  };
+
+  const detectedDepartmentsSet = new Set<string>();
+  const detectedDaysSet = new Set<string>();
+  let validRowsExtracted = 0;
+  let totalColliExtracted = 0;
+
+  // 4. Loop through data rows
+  for (let r = headerRowIdx + 1; r < rawRows.length; r++) {
+    const row = rawRows[r];
+    if (!Array.isArray(row) || row.length === 0) continue;
+
+    // Filter out rows matching Python line 94: df['Destinazione'] != "Eliminata dall'Ordine (Esclusa)"
+    if (colDestinazioneIdx >= 0 && row[colDestinazioneIdx]) {
+      const destStr = String(row[colDestinazioneIdx]);
+      if (destStr.includes("Eliminata dall'Ordine") || destStr.includes("Esclusa")) {
+        continue;
+      }
+    }
+
+    // Try extracting date from designated column, or check Column B (idx 1), or any cell
+    let dayInfo = extractDayOfWeek(row[colBDateIdx]);
+    if (!dayInfo && colBDateIdx !== 1) {
+      dayInfo = extractDayOfWeek(row[1]);
+    }
+    if (!dayInfo) {
+      // scan first 4 cells of row
+      for (let i = 0; i < Math.min(4, row.length); i++) {
+        dayInfo = extractDayOfWeek(row[i]);
+        if (dayInfo) break;
+      }
+    }
+
+    if (!dayInfo) continue; // Skip if no date recognized
+
+    // Extract department
+    const dept = extractDepartment(row[colDeptIdx], row);
+    if (!dept) continue;
+
+    // Extract colli effettivi (target principale: Colonna L)
+    let colli = parseColliNumber(row[colLEffettiviIdx]);
+    if (colli <= 0 && colLEffettiviIdx !== 11 && row.length > 11) {
+      colli = parseColliNumber(row[11]);
+    }
+    if (colli <= 0 && colKOrdinatiIdx >= 0 && row.length > colKOrdinatiIdx) {
+      colli = parseColliNumber(row[colKOrdinatiIdx]); // fallback to colli ordinati if L is blank
+    }
+
+    if (colli <= 0) continue;
+
+    // Record valid row
+    validRowsExtracted++;
+    totalColliExtracted += colli;
+    detectedDaysSet.add(dayInfo.dayName);
+    detectedDepartmentsSet.add(dept);
+
+    // Group by distinct calendar date
+    const dKey = dayInfo.dateKey;
+    if (!dateTotals[dKey]) {
+      dateTotals[dKey] = {
+        dayName: dayInfo.dayName,
+        reparti: { ALIMENTARI: 0, CHIMICA: 0, LIQUIDI: 0, PETFOOD: 0, PROFUMERIA: 0 }
+      };
+    }
+    dateTotals[dKey].reparti[dept] += colli;
+
+    // Also record direct sum
+    directDayTotals[dayInfo.dayName][dept] += colli;
+  }
+
+  const distinctDates = Object.keys(dateTotals);
+
+  if (validRowsExtracted === 0 || totalColliExtracted === 0) {
+    throw new Error(
+      `Nessun dato compatibile estratto dalle ${rawRows.length} righe. Assicurati che il file contenga:\n` +
+      `• Colonna B (o intestazione con Data): Data Allestimento\n` +
+      `• Colonna L (o intestazione con Effettivi): Colli Allestimento Effettivi\n` +
+      `• Colonna con i Sottoreparti: ALIMENTARI, CHIMICA, LIQUIDI, PETFOOD, PROFUMERIA.`
+    );
+  }
+
+  // Build representative weekly matrix
+  const resultMatrix: Record<string, Record<Sottoreparto, number>> = {
+    'Lunedì': { ALIMENTARI: 0, CHIMICA: 0, LIQUIDI: 0, PETFOOD: 0, PROFUMERIA: 0 },
+    'Martedì': { ALIMENTARI: 0, CHIMICA: 0, LIQUIDI: 0, PETFOOD: 0, PROFUMERIA: 0 },
+    'Mercoledì': { ALIMENTARI: 0, CHIMICA: 0, LIQUIDI: 0, PETFOOD: 0, PROFUMERIA: 0 },
+    'Giovedì': { ALIMENTARI: 0, CHIMICA: 0, LIQUIDI: 0, PETFOOD: 0, PROFUMERIA: 0 },
+    'Venerdì': { ALIMENTARI: 0, CHIMICA: 0, LIQUIDI: 0, PETFOOD: 0, PROFUMERIA: 0 },
+    'Sabato': { ALIMENTARI: 0, CHIMICA: 0, LIQUIDI: 0, PETFOOD: 0, PROFUMERIA: 0 },
+    'Domenica': { ALIMENTARI: 0, CHIMICA: 0, LIQUIDI: 0, PETFOOD: 0, PROFUMERIA: 0 },
+  };
+
+  // If there are multiple weeks of historical dates (e.g. > 7 dates), calculate average per day of week
+  if (distinctDates.length > 7) {
+    const dayCounts: Record<string, number> = {
+      'Lunedì': 0, 'Martedì': 0, 'Mercoledì': 0, 'Giovedì': 0, 'Venerdì': 0, 'Sabato': 0, 'Domenica': 0
+    };
+    const daySums: Record<string, Record<Sottoreparto, number>> = {
+      'Lunedì': { ALIMENTARI: 0, CHIMICA: 0, LIQUIDI: 0, PETFOOD: 0, PROFUMERIA: 0 },
+      'Martedì': { ALIMENTARI: 0, CHIMICA: 0, LIQUIDI: 0, PETFOOD: 0, PROFUMERIA: 0 },
+      'Mercoledì': { ALIMENTARI: 0, CHIMICA: 0, LIQUIDI: 0, PETFOOD: 0, PROFUMERIA: 0 },
+      'Giovedì': { ALIMENTARI: 0, CHIMICA: 0, LIQUIDI: 0, PETFOOD: 0, PROFUMERIA: 0 },
+      'Venerdì': { ALIMENTARI: 0, CHIMICA: 0, LIQUIDI: 0, PETFOOD: 0, PROFUMERIA: 0 },
+      'Sabato': { ALIMENTARI: 0, CHIMICA: 0, LIQUIDI: 0, PETFOOD: 0, PROFUMERIA: 0 },
+      'Domenica': { ALIMENTARI: 0, CHIMICA: 0, LIQUIDI: 0, PETFOOD: 0, PROFUMERIA: 0 },
+    };
+
+    for (const dKey of distinctDates) {
+      const entry = dateTotals[dKey];
+      dayCounts[entry.dayName] = (dayCounts[entry.dayName] || 0) + 1;
+      DEPARTMENTS.forEach((dept) => {
+        daySums[entry.dayName][dept] += entry.reparti[dept];
+      });
+    }
+
+    GIORNI_ITA.forEach((g) => {
+      const cnt = dayCounts[g] || 1;
+      DEPARTMENTS.forEach((dept) => {
+        resultMatrix[g][dept] = Math.round((daySums[g][dept] / cnt) * 10) / 10;
+      });
+    });
+  } else {
+    // Single week or short period: use direct daily sum
+    GIORNI_ITA.forEach((g) => {
+      DEPARTMENTS.forEach((dept) => {
+        resultMatrix[g][dept] = Math.round(directDayTotals[g][dept] * 10) / 10;
+      });
+    });
+  }
+
+  // Ensure Sunday is 0 as per business model rule
+  DEPARTMENTS.forEach((dept) => {
+    resultMatrix['Domenica'][dept] = 0;
+  });
+
+  return {
+    matrix: resultMatrix,
+    diagnostics: {
+      totalRowsRead: rawRows.length,
+      validRowsExtracted,
+      distinctDatesCount: distinctDates.length,
+      totalColliExtracted: Math.round(totalColliExtracted),
+      detectedDays: Array.from(detectedDaysSet),
+      detectedDepartments: Array.from(detectedDepartmentsSet),
+    }
+  };
+}
+
+// --------------------------------------------------------------------------
+// PERSISTENZA FILE CARICATO IN MEMORIA LOCALE (LOCALSTORAGE)
+// --------------------------------------------------------------------------
+export const STORAGE_KEYS = {
+  COLLI_DATA: 'gdo_forecast_colli_data',
+  DATASET_NAME: 'gdo_forecast_dataset_name',
+  SAVED_AT: 'gdo_forecast_saved_at',
+  DIAGNOSTICS: 'gdo_forecast_diagnostics',
+  PARAMS: 'gdo_forecast_params',
+};
+
+export interface StoredDataset {
+  matrix: Record<string, Record<Sottoreparto, number>>;
+  filename: string;
+  savedAt: string;
+  diagnostics?: {
+    validRowsExtracted: number;
+    totalColliExtracted: number;
+    distinctDatesCount: number;
+  };
+}
+
+export function saveLastUploadedToStorage(
+  data: Record<string, Record<Sottoreparto, number>>,
+  filename: string,
+  diagnostics?: {
+    validRowsExtracted: number;
+    totalColliExtracted: number;
+    distinctDatesCount: number;
+  }
+): void {
+  try {
+    localStorage.setItem(STORAGE_KEYS.COLLI_DATA, JSON.stringify(data));
+    localStorage.setItem(STORAGE_KEYS.DATASET_NAME, filename);
+    localStorage.setItem(STORAGE_KEYS.SAVED_AT, new Date().toISOString());
+    if (diagnostics) {
+      localStorage.setItem(STORAGE_KEYS.DIAGNOSTICS, JSON.stringify(diagnostics));
+    }
+  } catch (err) {
+    console.error('Impossibile salvare in localStorage:', err);
+  }
+}
+
+export function loadLastUploadedFromStorage(): StoredDataset | null {
+  try {
+    const rawData = localStorage.getItem(STORAGE_KEYS.COLLI_DATA);
+    const filename = localStorage.getItem(STORAGE_KEYS.DATASET_NAME);
+    const savedAt = localStorage.getItem(STORAGE_KEYS.SAVED_AT);
+    const diagRaw = localStorage.getItem(STORAGE_KEYS.DIAGNOSTICS);
+
+    if (rawData && filename) {
+      return {
+        matrix: JSON.parse(rawData),
+        filename,
+        savedAt: savedAt || new Date().toISOString(),
+        diagnostics: diagRaw ? JSON.parse(diagRaw) : undefined,
+      };
+    }
+  } catch (err) {
+    console.error('Impossibile leggere da localStorage:', err);
+  }
+  return null;
+}
+
+export function clearUploadedFromStorage(): void {
+  try {
+    localStorage.removeItem(STORAGE_KEYS.COLLI_DATA);
+    localStorage.removeItem(STORAGE_KEYS.DATASET_NAME);
+    localStorage.removeItem(STORAGE_KEYS.SAVED_AT);
+    localStorage.removeItem(STORAGE_KEYS.DIAGNOSTICS);
+  } catch (err) {
+    console.error('Impossibile eliminare da localStorage:', err);
+  }
+}
+
+

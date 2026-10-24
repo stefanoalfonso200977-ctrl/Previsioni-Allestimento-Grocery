@@ -1,13 +1,23 @@
 import React, { useState } from 'react';
-import { UploadCloud, FileSpreadsheet, X, AlertCircle, CheckCircle2 } from 'lucide-react';
+import { UploadCloud, FileSpreadsheet, X, AlertCircle, CheckCircle2, Database, Trash2 } from 'lucide-react';
 import { Sottoreparto } from '../types/forecasting';
 import { parseUploadedExcel } from '../services/forecastingEngine';
 
 interface FileUploadModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onDataLoaded: (data: Record<string, Record<Sottoreparto, number>>, filename: string) => void;
+  onDataLoaded: (
+    data: Record<string, Record<Sottoreparto, number>>,
+    filename: string,
+    diagnostics?: {
+      validRowsExtracted: number;
+      totalColliExtracted: number;
+      distinctDatesCount: number;
+    }
+  ) => void;
   onRestoreDefault: () => void;
+  savedAt?: string | null;
+  activeDatasetName?: string;
 }
 
 export const FileUploadModal: React.FC<FileUploadModalProps> = ({
@@ -15,26 +25,35 @@ export const FileUploadModal: React.FC<FileUploadModalProps> = ({
   onClose,
   onDataLoaded,
   onRestoreDefault,
+  savedAt,
+  activeDatasetName,
 }) => {
   const [isDragging, setIsDragging] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const [successMsg, setSuccessMsg] = useState<string | null>(null);
+  const [successDetails, setSuccessDetails] = useState<string | null>(null);
 
   if (!isOpen) return null;
 
   const handleFileProcess = async (file: File) => {
     setIsLoading(true);
     setErrorMsg(null);
-    setSuccessMsg(null);
+    setSuccessDetails(null);
 
     try {
-      const parsedMatrix = await parseUploadedExcel(file);
-      setSuccessMsg(`File "${file.name}" elaborato con successo!`);
+      const result = await parseUploadedExcel(file);
+      const diag = result.diagnostics;
+      setSuccessDetails(
+        `File elaborato: ${diag.validRowsExtracted.toLocaleString('it-IT')} righe valide estratte (${diag.totalColliExtracted.toLocaleString('it-IT')} colli su ${diag.distinctDatesCount} date).`
+      );
       setTimeout(() => {
-        onDataLoaded(parsedMatrix, file.name);
+        onDataLoaded(result.matrix, file.name, {
+          validRowsExtracted: diag.validRowsExtracted,
+          totalColliExtracted: diag.totalColliExtracted,
+          distinctDatesCount: diag.distinctDatesCount,
+        });
         onClose();
-      }, 700);
+      }, 1200);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Errore nel caricamento del file Excel.';
       setErrorMsg(msg);
@@ -77,8 +96,40 @@ export const FileUploadModal: React.FC<FileUploadModalProps> = ({
 
         <div className="p-5 space-y-4 text-xs">
           <p className="text-slate-600">
-            Carica il file Excel o CSV degli ordini per ricalcolare automaticamente le previsioni di allestimento, il dimensionamento della squadra e la mobilità interna secondo la pipeline del modello.
+            Carica il file Excel o CSV degli ordini per ricalcolare le previsioni di allestimento, il dimensionamento della squadra e la mobilità interna secondo la pipeline del modello.
           </p>
+
+          {/* Active Memory Status Notice */}
+          {savedAt && (
+            <div className="bg-emerald-50/80 border border-emerald-200 rounded-lg p-3 text-emerald-950 flex items-start justify-between gap-3">
+              <div className="flex items-start gap-2">
+                <Database className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                <div>
+                  <span className="font-bold text-emerald-900 block">
+                    File salvato in memoria permanente:
+                  </span>
+                  <span className="text-[11px] text-emerald-800">
+                    &ldquo;{activeDatasetName}&rdquo; &bull; Salvato alle {new Date(savedAt).toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit' })} del {new Date(savedAt).toLocaleDateString('it-IT')}.
+                  </span>
+                  <p className="text-[10px] text-emerald-700 mt-0.5">
+                    Quando esci o ricarichi la pagina, i dati rimangono conservati automaticamente nel browser.
+                  </p>
+                </div>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => {
+                  onRestoreDefault();
+                }}
+                className="text-[11px] font-semibold text-emerald-800 hover:text-red-700 underline shrink-0 inline-flex items-center gap-1"
+                title="Elimina il file salvato e ripristina il dataset di base"
+              >
+                <Trash2 className="w-3 h-3" />
+                Cancella
+              </button>
+            </div>
+          )}
 
           {/* Expected structure explanation */}
           <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 space-y-1.5 text-slate-700">
@@ -139,14 +190,14 @@ export const FileUploadModal: React.FC<FileUploadModalProps> = ({
           {errorMsg && (
             <div className="flex items-start gap-2 p-3 rounded-lg bg-red-50 border border-red-200 text-red-800">
               <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-red-600" />
-              <span>{errorMsg}</span>
+              <div className="whitespace-pre-line leading-relaxed">{errorMsg}</div>
             </div>
           )}
 
-          {successMsg && (
+          {successDetails && (
             <div className="flex items-center gap-2 p-3 rounded-lg bg-emerald-50 border border-emerald-200 text-emerald-800 font-medium">
-              <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-              <span>{successMsg}</span>
+              <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+              <span>{successDetails}</span>
             </div>
           )}
         </div>

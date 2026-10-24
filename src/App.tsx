@@ -13,24 +13,41 @@ import {
   DEFAULT_PARAMS,
   calculateForecast,
   exportExcelReport,
+  loadLastUploadedFromStorage,
+  saveLastUploadedToStorage,
+  clearUploadedFromStorage,
 } from './services/forecastingEngine';
 import { SimulationParams, Sottoreparto } from './types/forecasting';
-import { CheckCircle2 } from 'lucide-react';
+import { CheckCircle2, Database, Trash2 } from 'lucide-react';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<string>('squadra');
-  const [colliData, setColliData] = useState<Record<string, Record<Sottoreparto, number>>>(DEFAULT_COLLI_EFFETTIVI);
+
+  // Load last uploaded file from localStorage if present
+  const initialSaved = useMemo(() => {
+    return typeof window !== 'undefined' ? loadLastUploadedFromStorage() : null;
+  }, []);
+
+  const [colliData, setColliData] = useState<Record<string, Record<Sottoreparto, number>>>(
+    initialSaved ? initialSaved.matrix : DEFAULT_COLLI_EFFETTIVI
+  );
+  const [activeDatasetName, setActiveDatasetName] = useState<string>(
+    initialSaved ? initialSaved.filename : 'Benchmark Calibrato Modello Python'
+  );
+  const [savedAt, setSavedAt] = useState<string | null>(
+    initialSaved ? initialSaved.savedAt : null
+  );
+
   const [params, setParams] = useState<SimulationParams>(DEFAULT_PARAMS);
   const [isWhatIfOpen, setIsWhatIfOpen] = useState<boolean>(false);
   const [isUploadModalOpen, setIsUploadModalOpen] = useState<boolean>(false);
-  const [activeDatasetName, setActiveDatasetName] = useState<string>('Benchmark Calibrato Modello Python');
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
   const showToast = (msg: string) => {
     setToastMessage(msg);
     setTimeout(() => {
       setToastMessage(null);
-    }, 3500);
+    }, 4000);
   };
 
   // Baseline forecast with default benchmark values
@@ -54,18 +71,36 @@ export default function App() {
 
   const handleDataLoaded = (
     newMatrix: Record<string, Record<Sottoreparto, number>>,
-    filename: string
+    filename: string,
+    diagnostics?: {
+      validRowsExtracted: number;
+      totalColliExtracted: number;
+      distinctDatesCount: number;
+    }
   ) => {
+    // Save to persistent localStorage
+    saveLastUploadedToStorage(newMatrix, filename, diagnostics);
+    const nowIso = new Date().toISOString();
+    setSavedAt(nowIso);
     setColliData(newMatrix);
     setActiveDatasetName(filename);
-    showToast(`Dati caricati da "${filename}". Previsioni ricalcolate.`);
+
+    if (diagnostics) {
+      showToast(
+        `File salvato in memoria permanente! Caricati ${diagnostics.totalColliExtracted.toLocaleString('it-IT')} colli (${diagnostics.validRowsExtracted.toLocaleString('it-IT')} righe).`
+      );
+    } else {
+      showToast(`Dati salvati in memoria permanente del browser per le prossime sessioni.`);
+    }
   };
 
   const handleRestoreDefault = () => {
+    clearUploadedFromStorage();
+    setSavedAt(null);
     setColliData(DEFAULT_COLLI_EFFETTIVI);
     setParams(DEFAULT_PARAMS);
     setActiveDatasetName('Benchmark Calibrato Modello Python');
-    showToast('Ripristinato il dataset benchmark originale dal codice Python.');
+    showToast('Memoria cancellata. Ripristinato il dataset benchmark originale dal codice Python.');
   };
 
   return (
@@ -95,10 +130,22 @@ export default function App() {
           <div className="flex flex-wrap items-center gap-2">
             <span className="font-semibold text-slate-700">Dataset attivo:</span>
             <span className="text-slate-900 font-medium">{activeDatasetName}</span>
+
+            {savedAt ? (
+              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-emerald-50 text-emerald-850 border border-emerald-200 text-[11px] font-medium" title="I dati rimangono salvati nella memoria del browser anche se chiudi il programma">
+                <Database className="w-3 h-3 text-emerald-600" />
+                <span>In memoria permanente</span>
+              </span>
+            ) : (
+              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-100 text-slate-600 text-[11px]">
+                Predefinito Python
+              </span>
+            )}
+
             <span aria-hidden="true">·</span>
-            <span>Turno standard: {params.oreTurno.toFixed(1)}h</span>
+            <span>Turno: {params.oreTurno.toFixed(1)}h</span>
             <span aria-hidden="true">·</span>
-            <span>Soglia reparto: {params.sogliaArrotondamento.toFixed(2)}</span>
+            <span>Soglia: {params.sogliaArrotondamento.toFixed(2)}</span>
           </div>
 
           <div className="flex items-center gap-3">
@@ -106,8 +153,23 @@ export default function App() {
               onClick={() => setIsUploadModalOpen(true)}
               className="hover:text-slate-900 underline transition-colors"
             >
-              Cambia file Excel
+              Carica nuovo Excel
             </button>
+
+            {savedAt && (
+              <>
+                <span aria-hidden="true">·</span>
+                <button
+                  onClick={handleRestoreDefault}
+                  className="text-amber-800 hover:text-red-700 underline transition-colors inline-flex items-center gap-1 font-medium"
+                  title="Cancella il file dalla memoria permanente e torna al benchmark Python"
+                >
+                  <Trash2 className="w-3 h-3" />
+                  <span>Ripristina Benchmark Base</span>
+                </button>
+              </>
+            )}
+
             <span aria-hidden="true">·</span>
             <button
               onClick={handleExportExcel}
@@ -171,6 +233,8 @@ export default function App() {
         onClose={() => setIsUploadModalOpen(false)}
         onDataLoaded={handleDataLoaded}
         onRestoreDefault={handleRestoreDefault}
+        savedAt={savedAt}
+        activeDatasetName={activeDatasetName}
       />
 
       {/* Clean Footer with quiet links and no fake telemetry */}
